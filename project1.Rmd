@@ -1,0 +1,568 @@
+---
+title: "sta712_project1"
+author: "Anh Nguyen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Library
+
+```{r}
+# analysis
+library(tidyverse)
+library(statmod)
+library(car)
+library(MASS)
+library(ROCR)
+library(caret)
+# pretty table
+library(gtsummary)
+library(haven)
+library(labelled)
+library(flextable)
+```
+
+```{r}
+set.seed(3)
+```
+
+# Helper function
+
+```{r}
+logodds_plot <- function(data, num_bins, bin_method,
+                         x_name, y_name, grouping = NULL, 
+                         reg_formula = y ~ x){
+  
+  if(is.null(grouping)){
+    dat <- data.frame(x = data %>% pull(x_name), 
+                      y = data %>% pull(y_name),
+                      group = 1)
+  } else {
+    dat <- data.frame(x = data %>% pull(x_name), 
+                      y = data %>% pull(y_name),
+                      group = as.factor(data %>% pull(grouping)))
+  }
+  
+  if(bin_method == "equal_size"){
+    logodds_table <- dat %>%
+      drop_na() %>%
+      arrange(group, x) %>%
+      group_by(group) %>%
+      mutate(obs = y,
+             bin = rep(1:num_bins,
+                       each=ceiling(n()/num_bins))[1:n()]) %>%
+      group_by(bin, group) %>%
+      summarize(mean_x = mean(x),
+                prop = mean(c(obs, 0.5)),
+                num_obs = n()) %>%
+      ungroup() %>%
+      mutate(logodds = log(prop/(1 - prop)))
+  } else {
+    logodds_table <- dat %>%
+      drop_na() %>%
+      group_by(group) %>%
+      mutate(obs = y,
+             bin = cut(x, 
+                       breaks = num_bins,
+                       labels = F)) %>%
+      group_by(bin, group) %>%
+      summarize(mean_x = mean(x),
+                prop = mean(c(obs, 0.5)),
+                num_obs = n()) %>%
+      ungroup() %>%
+      mutate(logodds = log(prop/(1 - prop)))
+  }
+  
+  if(is.null(grouping)){
+    logodds_table %>%
+      ggplot(aes(x = mean_x,
+                 y = logodds)) +
+      geom_point(size=2) +
+      geom_smooth(se=F, method="lm", formula = reg_formula) +
+      theme_bw() +
+      labs(x = x_name,
+           y = "Empirical log odds") +
+      theme(text = element_text(size=15))
+  } else {
+    logodds_table %>%
+      ggplot(aes(x = mean_x,
+                 y = logodds,
+                 color = group,
+                 shape = group)) +
+      geom_point(size=2) +
+      geom_smooth(se=F, method="lm", formula = reg_formula) +
+      theme_bw() +
+      labs(x = x_name,
+           y = "Empirical log odds",
+           color = grouping,
+           shape = grouping) +
+      theme(text = element_text(size=15))
+  }
+  
+}
+
+#https://stackoverflow.com/questions/16347507/obtaining-threshold-values-from-a-roc-curve
+threshold <- function(predict, response) {
+    perf <- ROCR::performance(ROCR::prediction(predict, response), "sens", "spec")
+    df <- data.frame(cut = perf@alpha.values[[1]], sens = perf@x.values[[1]], spec = perf@y.values[[1]])
+    df[which.max(df$sens + df$spec), "cut"]
+}
+```
+
+
+# Data
+
+```{r}
+source("http://www.openintro.org/stat/data/cdc.R")
+```
+
+# Cleaning
+
+```{r}
+# make categorical columns as factor
+cdc <- cdc |>
+  mutate_at(vars(genhlth, hlthplan, smoke100, gender) ,
+            factor) |>
+  mutate(gender = 
+           case_match(
+             gender,
+             "f" ~ "Female",
+             "m" ~ "Male"
+           ))  |>
+  mutate(hlthplan =
+           case_when(
+             hlthplan == 0 ~ "No",
+             hlthplan == 1  ~ "Yes"
+           )) |>
+  mutate(smoke100 =
+           case_when(
+             smoke100 == 0 ~ "No",
+             smoke100 == 1  ~ "Yes"
+           )) 
+
+cdc$genhlth <- str_to_title(cdc$genhlth)
+
+var_label(cdc) <- list(genhlth = "General Health Level",
+                        exerany = "Any exercise",
+                        hlthplan = "Have Health Coverage",
+                        smoke100 = "Smoked at least 100 Cigarettes",
+                        height = "Height (inches)",
+                        weight = "Weight (pounds)",
+                        wtdesire = " Desired Weight (pounds)",
+                        age = "Age (years)",
+                        gender = "Biological Sex")
+
+# dataset containing ppl lose weight
+cdc2 <- cdc |>
+  mutate(wtchange = weight - wtdesire) |>
+  filter(wtchange > 0)
+
+var_label(cdc2) <- list(genhlth = "General Health Level",
+                        exerany = "Any exercise",
+                        hlthplan = "Have Health Coverage",
+                        smoke100 = "Smoked at least 100 Cigarettes",
+                        height = "Height (inches)",
+                        weight = "Weight (pounds)",
+                        wtdesire = " Desired Weight (pounds)",
+                        age = "Age (years)",
+                        wtchange = "Desire Weight Change (pounds)",
+                        gender = "Biological Sex")
+
+```
+
+
+
+```{r}
+# check missing data
+which(is.na(cdc))
+```
+
+# EDA
+
+```{r}
+# imbalance in genhlth:poor
+summary(cdc)
+
+summary(cdc2)
+```
+
+```{r}
+# histogram of numeric only
+numeric_cdc <- cdc %>% select(where(is.numeric)) 
+ggplot(gather(numeric_cdc, cols, value), aes(x = value)) + 
+       geom_histogram(binwidth = 5) + facet_grid(.~cols)
+```
+
+```{r}
+cor(numeric_cdc)
+## high correlation:
+# wtdesire - height
+# wtdesire - weight
+# height - weight
+```
+
+
+```{r}
+boxplot(cdc2$wtchange ~ cdc2$exerany)
+boxplot(cdc2$wtchange ~ cdc2$genhlth)
+boxplot(cdc2$wtchange ~ cdc2$hlthplan)
+plot(cdc2$wtchange ~ cdc2$age)
+```
+
+```{r}
+logodds_plot(cdc, 10, "equal_size", "weight", "exerany",
+             reg_formula = y ~ x)
+```
+
+
+```{r}
+emplogit = function(x, y, binsize = NULL, ci = FALSE, probit = FALSE,
+                    prob = FALSE, main = NULL, xlab = "", ylab = ""){
+  # x         vector with values of the independent variable
+  # y         vector of binary responses
+  # binsize   integer value specifying bin size (optional)
+  # ci        logical value indicating whether to plot approximate
+  #           confidence intervals (not supported as of 02/08/2015)
+  # probit    logical value indicating whether to plot probits instead
+  #           of logits
+  # prob      logical value indicating whether to plot probabilities
+  #           without transforming
+  #
+  # the rest are the familiar plotting options
+
+  if (length(x) != length(y))
+    stop("x and y lengths differ")
+  if (any(y < 0 | y > 1))
+    stop("y not between 0 and 1")
+  if (length(x) < 100 & is.null(binsize))
+    stop("Less than 100 observations: specify binsize manually")
+
+  if (is.null(binsize)) binsize = min(round(length(x)/10), 50)
+
+  if (probit){
+    link = qnorm
+    if (is.null(main)) main = "Empirical probits"
+  } else {
+    link = function(x) log(x/(1-x))
+    if (is.null(main)) main = "Empirical logits"
+  }
+
+  sort = order(x)
+  x = x[sort]
+  y = y[sort]
+  a = seq(1, length(x), by=binsize)
+  b = c(a[-1] - 1, length(x))
+
+  prob = xmean = ns = rep(0, length(a)) # ns is for CIs
+  for (i in 1:length(a)){
+    range = (a[i]):(b[i])
+    prob[i] = mean(y[range])
+    xmean[i] = mean(x[range])
+    ns[i] = b[i] - a[i] + 1 # for CI 
+  }
+
+  extreme = (prob == 1 | prob == 0)
+  prob[prob == 0] = min(prob[!extreme])
+  prob[prob == 1] = max(prob[!extreme])
+
+  g = link(prob) # logits (or probits if probit == TRUE)
+
+  linear.fit = lm(g[!extreme] ~ xmean[!extreme])
+  b0 = linear.fit$coef[1]
+  b1 = linear.fit$coef[2]
+
+  loess.fit = loess(g[!extreme] ~ xmean[!extreme])
+
+    plot(xmean, g, main=main, xlab=xlab, ylab=ylab)
+    abline(b0,b1)
+    lines(loess.fit$x, loess.fit$fitted, lwd=2, lty=2)
+}
+
+emplogit(cdc$age, cdc$exerany)
+
+```
+
+
+# Question 1: association
+
+## Fit Model
+
+```{r}
+m1 <- glm(exerany ~ log(wtchange) + age + genhlth + hlthplan ,
+          data = cdc2,
+          family = binomial)
+summary(m1)
+```
+```{r}
+m1 |>
+  tbl_regression() %>% 
+  add_vif() %>%
+  as_flex_table() %>% 
+  save_as_image(path = "association_table.png")
+```
+
+
+## Diagnostics
+
+```{r}
+# quantile residual plot
+# code from STA 711 lab
+data.frame(x = log(cdc2$wtchange), residuals = qresid(m1)) %>%
+  ggplot(aes(x = x, y = residuals)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(
+    x = "Log change in weight",
+    y = "Quantile Residuals"
+  )
+
+#ggsave("qresid_association_logwtchange.png")
+
+data.frame(x = cdc2$age, residuals = qresid(m1)) %>%
+  ggplot(aes(x = x, y = residuals)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(
+    x = "Age",
+    y = "Quantile Residuals"
+  )
+
+ggsave("qresid_association_age.png")
+
+## Cooks'distance
+cd <- cooks.distance(m1)
+# find if any is greater than 0.5
+cd[cd > 0.5]
+
+# variance inflation factor
+vif(m1)
+```
+
+
+
+# Question 2: prediction
+
+## Fit model 
+
+```{r}
+# remove highly correlated columns
+cdc3 <- cdc |>
+  select(-c(height))
+
+# create training and test splits
+train_sample <- sample(1:nrow(cdc3), 0.7*nrow(cdc3), replace = F)
+train <- cdc3[train_sample,]
+test <- cdc3[setdiff(1:nrow(cdc3), train_sample),]
+```
+
+
+```{r}
+# forward aic
+m0 <- glm(exerany ~ 1, data = train, family = binomial)
+aic <- stepAIC(m0, 
+               scope = ~ genhlth + hlthplan + smoke100 +
+                 weight + log(wtdesire) + age + gender,
+               direction = "both",
+               trace = 0)
+
+summary(aic)
+```
+
+```{r}
+bic <- stepAIC(m0, 
+               scope = ~ genhlth + hlthplan + smoke100 +
+                 weight + log(wtdesire) + age + gender,
+              direction = "both",
+              trace = 0, k = log(nrow(train)))
+
+summary(bic)
+```
+
+## Diagnostic
+
+```{r}
+## Diagnostics
+
+# quantile residual plot
+# code from STA 711 lab
+
+data.frame(x = train$age, residuals = qresid(bic)) %>%
+  ggplot(aes(x = x, y = residuals)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(
+    x = "Age",
+    y = "Quantile Residuals"
+  )
+
+ggsave("qresid_prediction_age.png")
+
+data.frame(x = train$weight, residuals = qresid(bic)) %>%
+  ggplot(aes(x = x, y = residuals)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(
+    x = "Weight",
+    y = "Quantile Residuals"
+  )
+
+ggsave("qresid_prediction_weight.png")
+
+data.frame(x = train$wtdesire, residuals = qresid(bic)) %>%
+  ggplot(aes(x = x, y = residuals)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(
+    x = "Weight Desire",
+    y = "Quantile Residuals"
+  )
+
+ggsave("qresid_prediction_weightdesire.png")
+
+## Cooks'distance
+cd <- cooks.distance(bic)
+# find if any is greater than 0.5
+cd[cd > 0.5]
+
+# variance inflation factor
+vif(bic)
+```
+
+## Assessment
+
+### AUC
+
+```{r}
+# code from lab activity of STA 712
+
+## TPR vs. FPR for forwardAIC
+pred1 <- prediction(aic$fitted.values, aic$y)
+perf1 <- performance(pred1,"tpr","fpr")
+
+## TPR vs. FPR for forward BIC
+pred2 <- prediction(bic$fitted.values, bic$y)
+perf2 <- performance(pred2,"tpr","fpr")
+
+## Plot both ROC curves on the same graph
+data.frame(fpr = c(perf1@x.values[[1]], perf2@x.values[[1]]),
+           tpr = c(perf1@y.values[[1]], perf2@y.values[[1]]),
+           model = c(rep("AIC", length(perf1@x.values[[1]])),
+                     rep("BIC", length(perf2@x.values[[1]])))) |>
+  ggplot(aes(x = fpr, y = tpr, color = model)) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  labs(x = "False positive rate (1 - Specificity)",
+       y = "True positive rate (Sensitivity)") +
+  theme_classic()
+
+## calculate AUC values
+performance(pred1, "auc")@y.values # AUC for AIC
+performance(pred2, "auc")@y.values # AUC for BIC
+
+# ROC Optimal threshold
+threshold(pred1@predictions, pred1@labels)
+threshold(pred2@predictions, pred2@labels)
+```
+```{r}
+# code from lab activity of STA 712
+train_predictions_aic <- predict(aic, newdata = train,
+                            type = "response")
+
+confusion_matrix <- table("Predicted" = ifelse(train_predictions_aic > 0.5, 1, 0),
+      "Observed" = train$exerany)
+confusion_matrix
+sum(diag(confusion_matrix))/sum(confusion_matrix)
+sensitivity(confusion_matrix)
+specificity(confusion_matrix)
+
+train_predictions_bic <- predict(bic, newdata = train,
+                            type = "response")
+
+confusion_matrix <- table("Predicted" = ifelse(train_predictions_bic > 0.5, 1, 0),
+      "Observed" = train$exerany)
+confusion_matrix
+sum(diag(confusion_matrix))/sum(confusion_matrix)
+sensitivity(confusion_matrix)
+specificity(confusion_matrix)
+```
+
+
+## Test data
+
+```{r}
+# code from lab activity of STA 712
+# predict on test data
+# AIC
+test_predictions_aic <- predict(aic, newdata = test,
+                            type = "response")
+pred_aic <- prediction(test_predictions_aic, test$exerany)
+
+ 
+# BIC
+test_predictions_bic <- predict(bic, newdata = test,
+                            type = "response")
+pred_bic <- prediction(test_predictions_bic, test$exerany)
+
+```
+
+```{r}
+# code from lab activity of STA 712
+confusion_matrix <- table("Predicted" = ifelse(test_predictions_aic > 0.5, 1, 0),
+      "Observed" = test$exerany)
+confusion_matrix
+sum(diag(confusion_matrix))/sum(confusion_matrix)
+sensitivity(confusion_matrix)
+specificity(confusion_matrix)
+```
+
+```{r}
+confusion_matrix <- table("Predicted" = ifelse(test_predictions_bic > 0.5, 1, 0),
+      "Observed" = test$exerany)
+confusion_matrix
+sum(diag(confusion_matrix))/sum(confusion_matrix)
+sensitivity(confusion_matrix)
+specificity(confusion_matrix)
+```
+
+# Table Creation
+
+## Baseline characteristics
+
+
+```{r}
+cdc_tab <- cdc2
+
+cdc_tab <- cdc_tab |>
+  mutate(exerany =
+           case_when(
+             exerany == 0 ~ "No exercise",
+             exerany == 1  ~ "Some exercise"
+           ))
+
+# order the levels
+cdc_tab <- cdc_tab %>% 
+  mutate(genhlth = factor(genhlth, levels = c("Poor", 
+                                              "Fair", 
+                                              "Good", 
+                                              "Very Good",
+                                              "Excellent")))
+```
+
+
+```{r}
+cdc_tab |>
+  tbl_summary(
+    by = exerany,
+    missing_text = "(Missing)",
+    statistic = list(all_continuous() ~ "{mean} ± {sd}")
+    ) |> 
+  add_overall() %>%
+  as_flex_table() %>% 
+  save_as_image(path = "characteristic_table.png")
+```
+
